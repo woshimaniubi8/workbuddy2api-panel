@@ -631,14 +631,13 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	// 企业上下文门控（企业版 / 企业切换会话）：行为事件会被上游静默丢弃或
-	// 直接 403，执行任何成长任务都是零收益白跑（含真实对话配额）——直接拒绝
-	// 并给出修复路径，不再让用户对着「已上报但进度 0/x」猜原因
-	// （见 auth.IsEnterpriseSession）。
-	if a.IsEnterpriseSession() {
-		writeErr(w, http.StatusUnprocessableEntity,
-			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
-		return
+	// 企业上下文提示（**只提示、不拦截**）：企业版 / 疑似企业切换会话下成长任务
+	// 行为事件可能被上游静默丢弃。此前这里是 422 直接拒绝，但 token_source=
+	// enterprise_switch 在个人身份登录的凭证上同样会出现（用户实测反馈），硬拦
+	// 会让正常账号连一次都跑不了。现在保留提示并继续执行，由回读进度判断真实结果。
+	notice := a.EnterpriseSwitchNotice()
+	if notice != "" {
+		log.Printf("panel: WARN 任务动作 uid=%s：%s", uid, notice)
 	}
 	var body struct {
 		TaskCode string `json:"task_code"`
@@ -704,6 +703,10 @@ func (p *Panel) accountTaskAuto(w http.ResponseWriter, r *http.Request) {
 		"claimable":        claimable,
 		"attempt":          act.Attempt,
 		"verify_supported": true,
+	}
+	// 企业切换会话提示随响应回传（前端以中性 toast 展示），但不影响执行结果。
+	if notice != "" {
+		resp["notice"] = notice
 	}
 	// 达标即自动领奖（Web 端 claim）：把"完成→领奖"收敛成一步，无需用户再点一次。
 	if claimable {
@@ -1274,13 +1277,11 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
-	// 企业上下文门控：与 accountTaskAuto 同口径（企业版 / 企业切换会话下成长任务
-	// 行为事件被上游静默丢弃，跑全量只会白耗真实对话配额）。「一键完成全部」与
-	// 单任务入口共用同一套动作，必须一并挡上（下游 fork 吸收本 PR 时发现的缺口）。
-	if a.IsEnterpriseSession() {
-		writeErr(w, http.StatusUnprocessableEntity,
-			"该账号为企业版/企业切换会话（token_source=enterprise_switch），无个人成长体系，成长任务行为事件会被上游忽略；请移除账号后以个人身份重新登录")
-		return
+	// 企业上下文提示（只提示、不拦截，与 accountTaskAuto 同口径）：
+	// token_source=enterprise_switch 可能是误报，硬挡会让正常账号一键跑不了全量。
+	notice := a.EnterpriseSwitchNotice()
+	if notice != "" {
+		log.Printf("panel: WARN 一键完成全部 uid=%s：%s", uid, notice)
 	}
 	// per-account 互斥（与单任务动作共用一把锁）：重复点击 409。
 	if !p.tryLockAccount(uid) {
@@ -1298,7 +1299,11 @@ func (p *Panel) accountTaskAutoAll(w http.ResponseWriter, r *http.Request) {
 	select {
 	case results := <-done:
 		log.Printf("panel: 一键完成可自动任务 uid=%s 共 %d 项", uid, len(results))
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "results": results})
+		out := map[string]any{"ok": true, "results": results}
+		if notice != "" {
+			out["notice"] = notice
+		}
+		writeJSON(w, http.StatusOK, out)
 	case <-ctx.Done():
 		// HTTP 侧超时返回，但后台流水线仍在跑——锁在流水线 goroutine 内释放，
 		// 期间重复点击会被 409 挡住，不会出现两轮并发。

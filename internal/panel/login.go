@@ -280,11 +280,11 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	delete(p.logins, state)
 	p.loginMu.Unlock()
 	log.Printf("panel: 新账号已热加载 uid=%s nickname=%q realm=%s（免重启生效）", acct.UID, acct.Nickname, sess.realm)
-	// 企业切换会话预警：该形态下 /v2/report 行为事件被上游静默丢弃（200 不计分），
-	// 成长任务全部无法点亮（签到/列表/额度/领养照常）。当场给出修复路径，
-	// 避免用户事后对着「已上报但进度 0/x」排查（见 auth.IsEnterpriseSession）。
-	if a.IsEnterpriseSession() && !a.IsEnterprise() {
-		log.Printf("panel: WARN uid=%s 的凭证为企业切换会话（token_source=enterprise_switch）：成长任务行为事件会被上游静默丢弃；建议移除该账号，在浏览器退出企业切换（个人身份）后重新登录", acct.UID)
+	// 企业切换会话预警（仅提示，不阻断登录/任务）：该形态下 /v2/report 行为事件
+	// 可能被上游静默丢弃（200 不计分）。注意 token_source=enterprise_switch 也可能是
+	// 误报（个人身份登录同样出现），故只记日志、不据此拒绝任何操作。
+	if notice := a.EnterpriseSwitchNotice(); notice != "" {
+		log.Printf("panel: WARN 新账号 uid=%s：%s", acct.UID, notice)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"done":            true,

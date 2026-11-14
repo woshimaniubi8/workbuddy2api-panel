@@ -29,9 +29,12 @@ func (s *Scheduler) RunStreakBonusNow() {
 		if a.IsGlobal() {
 			continue // D4 门控：global 无 CN 任务体系，不发起任何上游调用
 		}
-		if a.IsEnterpriseSession() {
-			continue // 企业版 / 企业切换会话门控：无成长体系（/activity/growth/streak 企业号 403；切换会话 200 但不计分）
+		if a.IsEnterprise() {
+			continue // 真企业版无个人成长体系（/activity/growth/streak 企业号 403）
 		}
+		// 企业切换会话只提示不跳过（见 warnEnterpriseSwitch）：该声明可能是误报，
+		// 跳过会让个人号永远拿不到连登奖励；真跑不动时由上游返回/日志暴露。
+		warnEnterpriseSwitch("streak-bonus", a)
 		s.streakBonusAccount(a)
 	}
 }

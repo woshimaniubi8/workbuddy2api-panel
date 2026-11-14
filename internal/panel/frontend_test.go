@@ -180,6 +180,9 @@ process.stdout.write(JSON.stringify({
 }
 
 // 模型限流时间必须同时支持上游 reset_at、网关 until 和无重置时间三种形态。
+// 注意：片段的求值必须带 'use strict'（与 app.js 顶部一致）。曾经这里按宽松模式
+// 执行，rateLimitMeta 里漏声明的 `detail = ...` 被当成隐式全局悄悄通过，而浏览器
+// 严格模式下会抛 ReferenceError，让整张账号表渲染中断（列表时好时坏）。
 func TestAppJSRateLimitMeta(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
@@ -193,7 +196,7 @@ const end = src.indexOf('function rateLimitRowsHtml');
 if (start < 0 || end < 0) throw new Error('rate limit helpers not found');
 const ctx = { Date, Number, String, Math };
 vm.createContext(ctx);
-vm.runInContext(src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
+vm.runInContext("'use strict';\n" + src.slice(start, end) + '\nthis.rateLimitMeta=rateLimitMeta;', ctx);
 const now = new Date(2026, 8, 28, 14, 0, 0).getTime();
 const reset = new Date(2026, 8, 28, 16, 0, 0).getTime();
 const until = new Date(2026, 8, 28, 15, 0, 0).getTime();
@@ -221,6 +224,79 @@ process.stdout.write(JSON.stringify({
 	const want = `{"rate":"网关 2026-09-28 15:00 起重试（剩余 1时00分） · 上游称 2026-09-28 16:00 恢复","unavailable":"预计 1时00分 后重试","unknown":"预计解封时间未知"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("rate-limit formatting=%s want %s", out, want)
+	}
+}
+
+// renderAccounts 必须能在「有账号带限流台账」时把整表渲染完。
+//
+// 回归背景：rateLimitMeta 里 `detail = ...` 漏声明，严格模式下抛
+// ReferenceError("detail is not defined")，异常发生在 list.map 内、innerHTML
+// 赋值之前——整张账号表停在空白，台账过期后又恢复正常，用户看到的就是
+// 「账号列表时好时坏」。这里用同时含双时钟/未知时间/模型不可用三种台账的账号
+// 直接调用 renderAccounts，任何渲染期异常都会让本用例失败。
+func TestAppJSRenderAccountsWithRateLimits(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; renderAccounts regression test skipped")
+	}
+	harness := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; },
+  apply() { return inert; },
+  construct() { return inert; },
+  has() { return true; },
+});
+const sandbox = {
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: { querySelectorAll: () => [], querySelector: () => inert, getElementById: () => inert, addEventListener() {}, documentElement: inert, head: inert, body: inert, createElement: () => inert, cookie: '' },
+  fetch: () => new Promise(() => {}),
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  MutationObserver: class { constructor() {} observe() {} disconnect() {} takeRecords() { return []; } },
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src, sandbox, { filename: 'app.js' });
+const t = Date.now();
+const rows = [{
+  uid: 'u1', nickname: 'n1', credits: 10, credits_total: 20,
+  rate_limited_models: [
+    { model: 'glm-5.3', kind: 'rate_limit', reset_at: new Date(t + 3600e3).toISOString(), until: new Date(t + 1800e3).toISOString() },
+    { model: 'glm-5.3', kind: 'rate_limit' },
+    { model: 'missing', kind: 'model_unavailable', until: new Date(t + 600e3).toISOString() },
+  ],
+}];
+try {
+  sandbox.renderAccounts(rows);
+  console.log('RENDER OK');
+  process.exit(0);
+} catch (e) {
+  console.log('RENDER FAIL:', (e && e.stack ? e.stack : e).toString().split('\n').slice(0, 5).join('\n'));
+  process.exit(1);
+}
+`
+	f, err := os.CreateTemp(t.TempDir(), "render-accounts-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(harness); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("renderAccounts 渲染失败（账号列表会空白）: %v\n%s", err, out)
+	}
+	if !bytes.Contains(out, []byte("RENDER OK")) {
+		t.Fatalf("renderAccounts 未通过:\n%s", out)
 	}
 }
 
@@ -1518,4 +1594,3 @@ process.stdout.write(JSON.stringify({
 			strings.TrimSpace(string(out)), want)
 	}
 }
-

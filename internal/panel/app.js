@@ -255,6 +255,12 @@ function rateLimitMeta(row, now) {
   const until = parseAPITime(row && row.until);
   const deadline = resetAt || until;
   const remaining = deadline > now ? Math.round((deadline - now) / 1000) : 0;
+  // 必须先声明：本文件是 'use strict'，下面两个分支里的 detail = ... 若没有声明
+  // 就会抛 ReferenceError（"detail is not defined"）。这条错误发生在
+  // renderAccounts 的 list.map 里，会让整张账号表 innerHTML 永远写不进去——
+  // 表现为「账号列表时好时坏」：只要有任何账号带限流台账就整表空白，
+  // 台账一过期又恢复正常。
+  let detail = '';
   if (kind === 'model_unavailable') {
     return {
       model,
@@ -339,7 +345,16 @@ $('btnKey').onclick = async () => {
     start();
   } catch (e) { $('keyErr').hidden = false; }
 };
-$('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+$('keyInput').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  // 回车必须挡掉表单的隐式提交（否则整页带 ?keyInput=... 重载，密钥框白填）。
+  // 这里用 JS 绑定而不是 onsubmit="return false"：严格 CSP（script-src 'self'）
+  // 会拦掉一切内联事件处理器，页面只会在控制台刷一条 violation。
+  e.preventDefault();
+  $('btnKey').click();
+});
+// 表单元素只为浏览器密码管理器识别而保留；提交动作统一由上面的 Enter / 按钮触发。
+$('keyForm').addEventListener('submit', e => e.preventDefault());
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 积分包明细共享缓存：「积分构成」视图与首页「积分到期提醒」卡片共用同一份
@@ -531,7 +546,15 @@ async function loadOverview(quiet) {
     // 「检查」之后卡片永远停在那一刻的旧数据。
     const liveFresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
     if ($('expBox') && !liveFresh) renderExpirySnapshot(d);
-  } catch (e) { if (!quiet) toast(e.message, 'err'); }
+  } catch (e) {
+    // 失败时把原因写进表格：原先 catch 只 toast（quiet 时连 toast 都没有），
+    // 表格停在空白态，用户只能看到「账号列表加载不出来」而没有任何线索。
+    // 5 秒轮询会重试，恢复后自动覆盖成正常内容。
+    const tb = $('accBody');
+    if (tb) tb.innerHTML = '<tr><td colspan="9"><div class="empty">账号列表加载失败：' +
+      esc(e && e.message ? e.message : e) + '（每 5 秒自动重试）</div></td></tr>';
+    if (!quiet) toast(e.message, 'err');
+  }
 }
 
 $('accBody').addEventListener('click', async ev => {
@@ -1644,6 +1667,8 @@ $('btnTaskAutoAll').onclick = async () => {
     const skipN = (r.results || []).filter(x => x.status === 'skipped').length;
     const errN = (r.results || []).filter(x => x.status === 'error').length;
     toast(`执行完成：成功 ${okN} 项，跳过 ${skipN} 项${errN ? '，失败 ' + errN + ' 项' : ''}`, errN ? 'err' : 'ok');
+    // 企业切换会话提示（后端 notice）：只提示、不阻断，执行结果以上面那条为准。
+    if (r.notice) setTimeout(() => toast(r.notice, ''), 400);
     console.log('auto_all results:', r.results);
   } catch (e) { toast(e.message, 'err'); }
   finally { btn.disabled = false; btn.textContent = '一键完成可自动任务'; loadTasks(); }
@@ -1725,6 +1750,8 @@ $('taskBody').addEventListener('click', async ev => {
         else if (r.attempt && !advanced) msg += '；进度未动，该任务可能需要官方客户端';
         toast(msg, (r.claimed || advanced) ? 'ok' : 'err');
       }
+      // 企业切换会话提示（后端 notice）：保留提示但不再中断执行。
+      if (r.notice) setTimeout(() => toast(r.notice, ''), 400);
       loadOverview(true);
     } else {
       const path = 'accounts/' + encodeURIComponent(taskUID) + '/tasks/' + (kind === 'claim' ? 'claim' : 'accept');

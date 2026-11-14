@@ -3,6 +3,7 @@ package panel
 import (
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -76,6 +77,80 @@ func TestIndexReferencesExternalScript(t *testing.T) {
 	// 反例保护：出现内联 <script>...</script> 内容块即为回归
 	if strings.Contains(body, "<script>\n") || strings.Contains(body, "<script> ") {
 		t.Error("index.html still contains an inline <script> block; CSP would block it")
+	}
+}
+
+// index.html 不得含内联事件处理器（onsubmit/onclick/onkeydown…）：
+// script-src 'self' 不含 unsafe-inline，内联处理器会被拦掉并在控制台刷
+// "Executing inline event handler violates..." —— 处理器里的逻辑（例如
+// onsubmit="return false" 挡表单提交）等于完全没生效。事件一律在 app.js 里绑定。
+func TestIndexHTMLNoInlineEventHandlers(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	re := regexp.MustCompile(`(?i)\son[a-z]+\s*=`)
+	if m := re.FindString(body); m != "" {
+		idx := strings.Index(body, m)
+		start := idx - 80
+		if start < 0 {
+			start = 0
+		}
+		end := idx + 120
+		if end > len(body) {
+			end = len(body)
+		}
+		t.Fatalf("index.html contains inline event handler %q (blocked by CSP): ...%s...", m, body[start:end])
+	}
+}
+
+// COOP 只对可信来源下发：浏览器会忽略 http://内网IP 上的 COOP 并打印
+// "...origin was untrustworthy" 告警，面板常以 http://内网IP 部署，故需按来源判断。
+func TestCOOPOnlyOnTrustworthyOrigin(t *testing.T) {
+	p := newTestPanel()
+	cases := []struct {
+		name string
+		req  func() *http.Request
+		want bool
+	}{
+		{"http 内网 IP 不下发", func() *http.Request {
+			return httptest.NewRequest("GET", "http://192.168.1.20:7863/panel/", nil)
+		}, false},
+		{"http 域名不下发", func() *http.Request {
+			return httptest.NewRequest("GET", "http://panel.example.com/panel/", nil)
+		}, false},
+		{"localhost 下发", func() *http.Request {
+			return httptest.NewRequest("GET", "http://localhost:7863/panel/", nil)
+		}, true},
+		{"127.0.0.1 下发", func() *http.Request {
+			return httptest.NewRequest("GET", "http://127.0.0.1:7863/panel/", nil)
+		}, true},
+		{"https 下发", func() *http.Request {
+			return httptest.NewRequest("GET", "https://panel.example.com/panel/", nil)
+		}, true},
+		{"反代 X-Forwarded-Proto=https 下发", func() *http.Request {
+			req := httptest.NewRequest("GET", "http://panel.example.com/panel/", nil)
+			req.Header.Set("X-Forwarded-Proto", "https")
+			return req
+		}, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			rec := httptest.NewRecorder()
+			p.ServeHTTP(rec, c.req())
+			got := rec.Header().Get("Cross-Origin-Opener-Policy")
+			if c.want && got != "same-origin" {
+				t.Errorf("COOP=%q want same-origin", got)
+			}
+			if !c.want && got != "" {
+				t.Errorf("COOP=%q want empty (trustworthy-origin gated)", got)
+			}
+			// CORP 与来源可信性无关，任何来源都必须下发。
+			if rec.Header().Get("Cross-Origin-Resource-Policy") != "same-origin" {
+				t.Error("CORP must always be set")
+			}
+		})
 	}
 }
 

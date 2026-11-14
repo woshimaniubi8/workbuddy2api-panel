@@ -12,7 +12,9 @@ package panel
 
 import (
 	_ "embed"
+	"net"
 	"net/http"
+	"strings"
 )
 
 //go:embed index.html
@@ -43,18 +45,50 @@ const csp = "default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inl
 	"frame-ancestors 'none'; base-uri 'none'"
 
 // setSecurityHeaders 写入面板统一安全响应头（页面与 API 都要，API 也含 JSON 数据）。
-func setSecurityHeaders(w http.ResponseWriter) {
+func setSecurityHeaders(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Security-Policy", csp)
 	w.Header().Set("X-Content-Type-Options", "nosniff") // 禁 MIME 嗅探
 	w.Header().Set("X-Frame-Options", "DENY")           // 老浏览器兜底（CSP frame-ancestors 的等价项）
 	w.Header().Set("Referrer-Policy", "no-referrer")    // 不外泄面板地址给外部站点
-	w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+	// COOP 只对「可信来源」生效：浏览器对 http://内网IP 这类不可信来源会直接忽略
+	// 该头，并在控制台刷一条 "...has been ignored, because the URL's origin was
+	// untrustworthy" 的告警。面板常以 http://内网IP 部署，故按来源判断后再发，
+	// 避免无意义告警；HTTPS / localhost 下行为不变（防 opener 劫持）。
+	if trustworthyOrigin(r) {
+		w.Header().Set("Cross-Origin-Opener-Policy", "same-origin")
+	}
 	w.Header().Set("Cross-Origin-Resource-Policy", "same-origin")
+}
+
+// trustworthyOrigin 报告请求来源是否属于浏览器认可的「潜在可信来源」：
+// https、localhost / 127.0.0.1 / [::1]（http 也视为可信）。
+// 反向代理后 r.TLS 为 nil，故一并看 X-Forwarded-Proto。
+func trustworthyOrigin(r *http.Request) bool {
+	if r == nil {
+		return false
+	}
+	if r.TLS != nil {
+		return true
+	}
+	if proto := r.Header.Get("X-Forwarded-Proto"); proto != "" {
+		if i := strings.IndexByte(proto, ','); i >= 0 {
+			proto = proto[:i]
+		}
+		if strings.EqualFold(strings.TrimSpace(proto), "https") {
+			return true
+		}
+	}
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.Trim(strings.ToLower(strings.TrimSpace(host)), "[]")
+	return host == "localhost" || host == "127.0.0.1" || host == "::1"
 }
 
 // index 输出面板页面（静态无秘密；数据接口 /panel/api/* 才走鉴权）。
 func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
+	setSecurityHeaders(w, r)
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(indexHTML)
@@ -62,7 +96,7 @@ func (p *Panel) index(w http.ResponseWriter, r *http.Request) {
 
 // appScript 输出前端逻辑（同源脚本，供 CSP script-src 'self' 加载）。
 func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
+	setSecurityHeaders(w, r)
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(appJS)
@@ -71,7 +105,7 @@ func (p *Panel) appScript(w http.ResponseWriter, r *http.Request) {
 // mobileStyle 输出手机端适配样式（同源样式表，CSP style-src 'self' 加载）。
 // 单独成文而非写进 index.html：上游频繁改 index.html，独立文件可避免同步上游时反复冲突。
 func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
+	setSecurityHeaders(w, r)
 	w.Header().Set("Content-Type", "text/css; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(mobileCSS)
@@ -79,7 +113,7 @@ func (p *Panel) mobileStyle(w http.ResponseWriter, r *http.Request) {
 
 // mobileScript 输出手机端联动逻辑（同源脚本，须在 app.js 之后加载）。
 func (p *Panel) mobileScript(w http.ResponseWriter, r *http.Request) {
-	setSecurityHeaders(w)
+	setSecurityHeaders(w, r)
 	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write(mobileJS)

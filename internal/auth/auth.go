@@ -234,6 +234,23 @@ func (a *Auth) IsEnterpriseSession() bool {
 	return jwtTokenSource(a.AccessTokenValue()) == "enterprise_switch"
 }
 
+// EnterpriseSwitchNotice 返回「企业切换会话」的**提示**文案（无提示返回空串）。
+//
+// 与 IsEnterpriseSession 的区别：后者是判据，本方法只负责措辞。调用方应当把
+// 文案写进日志 / 响应提示，然后**继续执行**后续逻辑，不得据此 return / continue。
+// 原因：token_source=enterprise_switch 在个人身份登录的凭证上同样会出现（用户
+// 实测反馈），拿它当硬门控会让正常账号的成长任务永远不执行，比上游静默丢弃
+// 更难排查。真企业版（EnterpriseID 非空）另有独立的 IsEnterprise 门控，不受影响。
+func (a *Auth) EnterpriseSwitchNotice() string {
+	if a.IsEnterprise() {
+		return ""
+	}
+	if jwtTokenSource(a.AccessTokenValue()) != "enterprise_switch" {
+		return ""
+	}
+	return "凭证带 token_source=enterprise_switch（疑企业切换会话）：成长任务行为事件可能被上游静默丢弃。若确认是个人身份登录可忽略本提示（已继续执行）；否则请移除该账号并在浏览器退出企业切换后重新登录"
+}
+
 // jwtTokenSource 解出 JWT payload 中的 token_source 声明；非 JWT / 解码失败
 // 一律返回 ""（老 token 与非标准形态按无此声明处理，零回归）。先按无填充
 // base64url 解（JWT 标准），失败再试带填充形态（兼容非标准签发方）。
